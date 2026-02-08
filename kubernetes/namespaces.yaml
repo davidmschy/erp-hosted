@@ -1,0 +1,22 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: genii-erp
+  labels:
+    app.kubernetes.io/name: genii-erp
+    app.kubernetes.io/component: platform
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: genii-erp-staging
+  labels:
+    app.kubernetes.io/name: genii-erp
+    app.kubernetes.io/component: staging
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ingress-nginx
+  labels:
+    app.kubernetes.io/name: ingress-nginx

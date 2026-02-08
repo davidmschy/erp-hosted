@@ -1,0 +1,182 @@
+# Prometheus and Grafana for Monitoring
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: monitoring
+---
+apiVersion: helm.toolkit.fluxcd.io/v2beta1
+kind: HelmRelease
+metadata:
+  name: prometheus
+  namespace: monitoring
+spec:
+  interval: 5m
+  chart:
+    spec:
+      chart: kube-prometheus-stack
+      version: "54.0.1"
+      sourceRef:
+        kind: HelmRepository
+        name: prometheus-community
+        namespace: flux-system
+  values:
+    prometheus:
+      prometheusSpec:
+        retention: 30d
+        retentionSize: "50GB"
+        resources:
+          requests:
+            cpu: 500m
+            memory: 1Gi
+          limits:
+            cpu: 2000m
+            memory: 4Gi
+        storageSpec:
+          volumeClaimTemplate:
+            spec:
+              storageClassName: gp3
+              resources:
+                requests:
+                  storage: 100Gi
+        additionalScrapeConfigs:
+          - job_name: 'genii-erp-api'
+            kubernetes_sd_configs:
+              - role: pod
+                namespaces:
+                  names:
+                    - genii-erp
+            relabel_configs:
+              - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+                action: keep
+                regex: true
+              - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+                action: replace
+                target_label: __metrics_path__
+                regex: (.+)
+              - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+                action: replace
+                regex: ([^:]+)(?::\d+)?;(\d+)
+                replacement: $1:$2
+                target_label: __address__
+    grafana:
+      enabled: true
+      admin:
+        existingSecret: grafana-admin-credentials
+      ingress:
+        enabled: true
+        ingressClassName: nginx
+        hosts:
+          - grafana.geniinow.com
+        tls:
+          - secretName: grafana-tls
+            hosts:
+              - grafana.geniinow.com
+      persistence:
+        enabled: true
+        size: 10Gi
+        storageClassName: gp3
+      dashboardProviders:
+        dashboardproviders.yaml:
+          apiVersion: 1
+          providers:
+            - name: 'genii-erp'
+              orgId: 1
+              folder: 'Genii ERP'
+              type: file
+              disableDeletion: false
+              editable: true
+              options:
+                path: /var/lib/grafana/dashboards/genii-erp
+      dashboards:
+        genii-erp:
+          genii-erp-overview:
+            url: https://raw.githubusercontent.com/geniinow/erp-hosted/main/monitoring/dashboards/overview.json
+    alertmanager:
+      enabled: true
+      config:
+        global:
+          slack_api_url: '${SLACK_WEBHOOK_URL}'
+        route:
+          receiver: 'slack-notifications'
+          group_by: ['alertname', 'priority']
+          group_wait: 10s
+          group_interval: 5m
+          repeat_interval: 12h
+          routes:
+            - match:
+                severity: critical
+              receiver: 'pagerduty-critical'
+              continue: true
+        receivers:
+          - name: 'slack-notifications'
+            slack_configs:
+              - channel: '#alerts'
+                send_resolved: true
+                title: '{{ range .Alerts }}{{ .Annotations.summary }}{{ end }}'
+                text: '{{ range .Alerts }}{{ .Annotations.description }}{{ end }}'
+          - name: 'pagerduty-critical'
+            pagerduty_configs:
+              - service_key: '${PAGERDUTY_KEY}'
+---
+apiVersion: helm.toolkit.fluxcd.io/v2beta1
+kind: HelmRelease
+metadata:
+  name: loki
+  namespace: monitoring
+spec:
+  interval: 5m
+  chart:
+    spec:
+      chart: loki
+      version: "5.41.0"
+      sourceRef:
+        kind: HelmRepository
+        name: grafana
+        namespace: flux-system
+  values:
+    loki:
+      auth_enabled: false
+      commonConfig:
+        replication_factor: 1
+      storage:
+        type: 's3'
+        s3:
+          region: us-east-1
+          bucketnames: genii-erp-loki-logs
+    write:
+      replicas: 2
+      persistence:
+        size: 50Gi
+    read:
+      replicas: 2
+    backend:
+      replicas: 2
+    gateway:
+      enabled: true
+---
+apiVersion: helm.toolkit.fluxcd.io/v2beta1
+kind: HelmRelease
+metadata:
+  name: tempo
+  namespace: monitoring
+spec:
+  interval: 5m
+  chart:
+    spec:
+      chart: tempo
+      version: "1.7.0"
+      sourceRef:
+        kind: HelmRepository
+        name: grafana
+        namespace: flux-system
+  values:
+    tempo:
+      retention: 168h
+      metricsGenerator:
+        enabled: true
+      storage:
+        trace:
+          backend: s3
+          s3:
+            bucket: genii-erp-tempo-traces
+            region: us-east-1

@@ -1,0 +1,264 @@
+# AI Service Integration for Genii ERP
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: genii-ai-service
+  namespace: genii-erp
+  labels:
+    app: genii-ai-service
+    tier: ai
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: genii-ai-service
+  template:
+    metadata:
+      labels:
+        app: genii-ai-service
+        tier: ai
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: "/metrics"
+    spec:
+      nodeSelector:
+        ai-ready: "true"
+      tolerations:
+        - key: "ai-workload"
+          operator: "Equal"
+          value: "true"
+          effect: "NoSchedule"
+      serviceAccountName: genii-erp-sa
+      containers:
+        - name: ai-service
+          image: geniinow/genii-ai-service:latest
+          ports:
+            - containerPort: 8080
+              name: http
+            - containerPort: 9090
+              name: metrics
+          env:
+            - name: OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: genii-erp-secrets
+                  key: openai-api-key
+            - name: OPENAI_ORG_ID
+              valueFrom:
+                secretKeyRef:
+                  name: genii-erp-secrets
+                  key: openai-org-id
+            - name: ANTHROPIC_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: genii-erp-secrets
+                  key: anthropic-api-key
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: genii-erp-secrets
+                  key: redis-url
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: genii-erp-secrets
+                  key: database-url
+            - name: LOCAL_MODEL_ENABLED
+              value: "true"
+            - name: LOCAL_MODEL_URL
+              value: "http://ollama:11434"
+            - name: RATE_LIMIT_ENABLED
+              value: "true"
+            - name: DEFAULT_TOKENS_PER_MINUTE
+              value: "10000"
+            - name: DEFAULT_TOKENS_PER_DAY
+              value: "1000000"
+            - name: FALLBACK_STRATEGY
+              value: "local"
+          resources:
+            requests:
+              memory: "1Gi"
+              cpu: "500m"
+            limits:
+              memory: "4Gi"
+              cpu: "4000m"
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: genii-ai-service
+  namespace: genii-erp
+  labels:
+    app: genii-ai-service
+spec:
+  type: ClusterIP
+  selector:
+    app: genii-ai-service
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: genii-ai-service-hpa
+  namespace: genii-erp
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: genii-ai-service
+  minReplicas: 2
+  maxReplicas: 20
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Pods
+      pods:
+        metric:
+          name: openai_requests_per_second
+        target:
+          type: AverageValue
+          averageValue: "50"
+---
+# Local Model Fallback (Ollama)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ollama
+  namespace: genii-erp
+  labels:
+    app: ollama
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ollama
+  template:
+    metadata:
+      labels:
+        app: ollama
+    spec:
+      nodeSelector:
+        ai-ready: "true"
+      tolerations:
+        - key: "ai-workload"
+          operator: "Equal"
+          value: "true"
+          effect: "NoSchedule"
+      containers:
+        - name: ollama
+          image: ollama/ollama:latest
+          ports:
+            - containerPort: 11434
+          env:
+            - name: OLLAMA_ORIGINS
+              value: "*"
+          volumeMounts:
+            - name: ollama-models
+              mountPath: /root/.ollama
+          resources:
+            requests:
+              memory: "4Gi"
+              cpu: "2000m"
+            limits:
+              memory: "16Gi"
+              cpu: "8000m"
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 11434
+            initialDelaySeconds: 60
+            periodSeconds: 30
+      volumes:
+        - name: ollama-models
+          persistentVolumeClaim:
+            claimName: ollama-models-pvc
+      initContainers:
+        - name: pull-models
+          image: ollama/ollama:latest
+          command:
+            - /bin/sh
+            - -c
+            - |
+              ollama serve &
+              sleep 5
+              ollama pull llama2:13b
+              ollama pull codellama:7b
+              ollama pull mistral:7b
+          volumeMounts:
+            - name: ollama-models
+              mountPath: /root/.ollama
+          resources:
+            requests:
+              memory: "4Gi"
+              cpu: "2000m"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ollama
+  namespace: genii-erp
+spec:
+  type: ClusterIP
+  selector:
+    app: ollama
+  ports:
+    - port: 11434
+      targetPort: 11434
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ollama-models-pvc
+  namespace: genii-erp
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: gp3
+  resources:
+    requests:
+      storage: 100Gi
+---
+# Token Usage Monitoring Job
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: ai-usage-reporter
+  namespace: genii-erp
+spec:
+  schedule: "0 * * * *"
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: genii-erp-sa
+          containers:
+            - name: reporter
+              image: geniinow/genii-ai-service:latest
+              command: ["node", "scripts/report-usage.js"]
+              env:
+                - name: DATABASE_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: genii-erp-secrets
+                      key: database-url
+          restartPolicy: OnFailure
